@@ -4,7 +4,7 @@ Turn a photo into a ceiling of colorful balloons. Choose an image and watch the 
 
 **Live site:** [daveseidman.github.io/balloon-art](https://daveseidman.github.io/balloon-art/)
 
-![Balloon Art social preview](public/balloon-art-social.jpg)
+![Balloon Art social preview](public/new.png)
 
 ## How it works
 
