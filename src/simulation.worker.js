@@ -51,9 +51,30 @@ function capture(bodies, time) {
   return { time, poses }
 }
 
+function settleUpright(body) {
+  const q = body.rotation()
+  // Remove pitch and roll gradually, preserving the balloon's yaw.
+  const twistLength = Math.hypot(q.y, q.w)
+  const y = twistLength > 1e-6 ? q.y / twistLength : 0
+  const w = twistLength > 1e-6 ? q.w / twistLength : 1
+  const alpha = 1 - Math.exp(-2 * STEP)
+  const next = { x: q.x * (1 - alpha), y: q.y + (y - q.y) * alpha, z: q.z * (1 - alpha), w: q.w + (w - q.w) * alpha }
+  const length = Math.hypot(next.x, next.y, next.z, next.w)
+  body.setRotation({ x: next.x / length, y: next.y / length, z: next.z / length, w: next.w / length }, false)
+  // Contact forces should not spin a nearly resting balloon away from upright.
+  const angular = body.angvel()
+  const decay = Math.exp(-3 * STEP)
+  body.setAngvel({ x: angular.x * decay, y: angular.y * decay, z: angular.z * decay }, false)
+}
+
 export async function simulate({ vertices, indices, ceilingPosition, settings }) {
   await RAPIER.init()
   const world = new RAPIER.World({ x: 0, y: settings.lift, z: 0 })
+  let seed = (settings.seed ?? 0) >>> 0
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+    return seed / 4294967296
+  }
   world.timestep = STEP
   const roof = RAPIER.ColliderDesc.trimesh(vertices, indices)
   roof.setTranslation(...ceilingPosition)
@@ -74,8 +95,8 @@ export async function simulate({ vertices, indices, ceilingPosition, settings })
     const time = tick * STEP
     while (bodies.length < settings.maxBalloons && time + 1e-8 >= nextRelease) {
       const id = bodies.length
-      const angle = Math.random() * Math.PI * 2
-      const radius = Math.sqrt(Math.random()) * settings.spawnRadius
+      const angle = random() * Math.PI * 2
+      const radius = Math.sqrt(random()) * settings.spawnRadius
       const position = [Math.cos(angle) * radius, settings.spawnHeight, Math.sin(angle) * radius]
       const scale = settings.balloonSize
       const body = world.createRigidBody(
@@ -102,6 +123,7 @@ export async function simulate({ vertices, indices, ceilingPosition, settings })
     }
     for (const { body } of bodies) keepSpeed(body)
     world.step()
+    for (const { body } of bodies) settleUpright(body)
 
     let activity = 0
     let quietCount = 0
@@ -116,7 +138,9 @@ export async function simulate({ vertices, indices, ceilingPosition, settings })
           + Math.hypot(angular.x, angular.y, angular.z) * settings.balloonSize * 0.15
         activity += speed
         roomCount += 1
-        if (body.isSleeping() || speed < settings.balloonSize) quietCount += 1
+        const rotation = body.rotation()
+        const upY = 1 - 2 * (rotation.x * rotation.x + rotation.z * rotation.z)
+        if ((body.isSleeping() || speed < settings.balloonSize) && upY > Math.cos(Math.PI / 18)) quietCount += 1
       }
     }
     const lowActivity = allReleased && roomCount > 0

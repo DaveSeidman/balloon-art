@@ -11,12 +11,12 @@ import ROOF_URL from './assets/roof1.glb'
 import BALLOON_URL from './assets/balloon1.glb'
 import VENICE_SUNSET_HDR from './assets/venice_sunset_2k.hdr'
 import CAT_SAMPLER_IMAGE from './assets/cat-sampler.jpg'
+import { decodeSamples, encodeSamples, readShareParams, samplesPreview, SIMULATION_DEFAULTS } from './share.js'
+import { quantizeSamples } from './palette.js'
 
 const ReflectionMapContext = createContext(null)
-const MAX_BALLOONS = 800
+const MAX_BALLOONS = 1000
 const SAMPLE_GRID = 32
-const SAMPLE_BLOCK = 8
-const SAMPLE_SIZE = SAMPLE_GRID * SAMPLE_BLOCK
 
 function PlaybackRunner({ playing, frames, bodyRegistry, visualRegistry, onComplete }) {
   const cursor = useRef(0)
@@ -142,8 +142,6 @@ function BalloonReturnMotion({ balloons, bodyRegistry, enabled }) {
       const angle = rotation.angleTo(targetRotation)
       if (body.isSleeping()) {
         if (distance < balloon.scale * 0.08 && angle < 0.05) {
-          body.setTranslation({ x, y, z }, false)
-          body.setRotation({ x: targetRotation.x, y: targetRotation.y, z: targetRotation.z, w: targetRotation.w }, false)
           continue
         }
         // Rapier may sleep before the algebraic return has reached its destination.
@@ -193,7 +191,7 @@ function PhotoDropzone({ src, onFile, large = false }) {
   </div>
 }
 
-function CameraRig({ mode }) {
+function CameraRig({ mode, idle }) {
   const { camera, gl } = useThree()
   const pointer = useRef(new THREE.Vector2())
   const target = useRef(new THREE.Vector2())
@@ -210,19 +208,20 @@ function CameraRig({ mode }) {
     gl.domElement.addEventListener('pointermove', move)
     return () => gl.domElement.removeEventListener('pointermove', move)
   }, [mode, gl])
-  useFrame(() => {
+  useFrame(({ clock }) => {
     if (mode !== 'Pointer tilt') return
-    target.current.lerp(pointer.current, 0.045)
+    target.current.x = THREE.MathUtils.lerp(target.current.x, idle ? Math.sin(clock.elapsedTime * 0.18) * 0.25 : pointer.current.x, 0.045)
+    target.current.y = THREE.MathUtils.lerp(target.current.y, idle ? Math.cos(clock.elapsedTime * 0.14) * 0.12 : pointer.current.y, 0.045)
     camera.position.set(0, 1.35, 2)
     camera.lookAt(target.current.x * 0.8, 3.1 + target.current.y * 0.9, 0)
   })
   return null
 }
 
-function CameraControls({ mode }) {
+function CameraControls({ mode, idle }) {
   return <>
-    <CameraRig mode={mode} />
-    {mode === 'Orbit' && <OrbitControls target={[0, 2.6, 0]} enablePan minDistance={0.25} maxDistance={8} minPolarAngle={0.05} maxPolarAngle={Math.PI - 0.05} />}
+    <CameraRig mode={idle ? 'Pointer tilt' : mode} idle={idle} />
+    {!idle && mode === 'Orbit' && <OrbitControls target={[0, 2.6, 0]} enablePan minDistance={0.25} maxDistance={8} minPolarAngle={0.05} maxPolarAngle={Math.PI - 0.05} />}
   </>
 }
 
@@ -251,7 +250,7 @@ function RendererSettings({ exposure, shadows }) {
   return null
 }
 
-function ReflectionProbe({ children, resolution, refreshSeconds, live }) {
+function ReflectionProbe({ children, resolution, refreshSeconds, live, visualRegistry }) {
   const { fbo, camera: probeCamera, update } = useCubeCamera({ resolution, near: 0.1, far: 24 })
   const captured = useRef(false)
   const wasLive = useRef(false)
@@ -261,7 +260,14 @@ function ReflectionProbe({ children, resolution, refreshSeconds, live }) {
     const justFinished = live && !wasLive.current
     wasLive.current = live
     if (!captured.current || justFinished || (live && refreshSeconds > 0 && clock.elapsedTime - lastCapture.current >= refreshSeconds)) {
-      update()
+      // Capture the room without feeding the probe's own balloon reflections back into it.
+      const hidden = []
+      visualRegistry.current.forEach(({ balloon, ribbon }) => {
+        for (const mesh of [balloon.current, ribbon.current]) {
+          if (mesh?.visible) { mesh.visible = false; hidden.push(mesh) }
+        }
+      })
+      try { update() } finally { for (const mesh of hidden) mesh.visible = true }
       captured.current = true
       lastCapture.current = clock.elapsedTime
     }
@@ -545,6 +551,49 @@ function Balloons({ settings, balloons, bodyRegistry, visualRegistry, playbackAc
   return balloons.map((balloon) => <Balloon key={balloon.id} {...balloon} balloonGeometry={geometry} balloonOffset={nodes.Sphere.position} debug={settings.debugPhysics} friction={settings.friction} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} playbackActive={playbackActive} initialVisible={initialVisible} reflectionStrength={reflectionStrength} />)
 }
 
+function CeilingDepthOfField({ settings }) {
+  const effect = useRef()
+  const { scene, nodes } = useGLTF(ROOF_URL)
+  const probe = useMemo(() => {
+    scene.updateMatrixWorld(true)
+    // Use the hidden ceiling's geometry and world transform without rendering it.
+    const mesh = new THREE.Mesh(nodes.ceiling.geometry, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }))
+    mesh.matrixAutoUpdate = false
+    mesh.matrix.copy(nodes.ceiling.matrixWorld)
+    mesh.updateMatrixWorld(true)
+    return mesh
+  }, [scene, nodes.ceiling])
+  const raycaster = useMemo(() => new THREE.Raycaster(), [])
+  const center = useMemo(() => new THREE.Vector2(0, 0), [])
+  const tracking = useRef({
+    matrix: new THREE.Matrix4(), projection: new THREE.Matrix4(),
+    effect: null, focus: settings.focusDistance, initialized: false,
+  })
+  useEffect(() => () => probe.material.dispose(), [probe])
+  useEffect(() => { tracking.current.initialized = false }, [settings.autoFocus])
+  useFrame(({ camera }, dt) => {
+    if (!settings.autoFocus || !effect.current) return
+    camera.updateWorldMatrix(true, false)
+    const state = tracking.current
+    const freshEffect = state.effect !== effect.current
+    if (!state.initialized || freshEffect || !state.matrix.equals(camera.matrixWorld) || !state.projection.equals(camera.projectionMatrix)) {
+      raycaster.setFromCamera(center, camera)
+      const hit = raycaster.intersectObject(probe, false)[0]
+      if (hit) state.focus = effect.current.calculateFocusDistance(hit.point)
+      else if (!state.initialized) state.focus = settings.focusDistance
+      state.matrix.copy(camera.matrixWorld)
+      state.projection.copy(camera.projectionMatrix)
+      state.effect = effect.current
+      if (!state.initialized || freshEffect) effect.current.cocMaterial.focusDistance = state.focus
+      state.initialized = true
+    }
+    // Smooth focus changes, keeping the last ceiling hit when the view misses it.
+    const material = effect.current.cocMaterial
+    material.focusDistance = THREE.MathUtils.lerp(material.focusDistance, state.focus, 1 - Math.exp(-8 * dt))
+  })
+  return <DepthOfField ref={effect} focusDistance={settings.focusDistance} focusRange={settings.focusRange} bokehScale={settings.blurStrength} height={settings.effectResolution} />
+}
+
 function Scene({ settings, rendering, postEffects, balloons, bodyRegistry, visualRegistry, phase, onRoofGeometry, playbackFrames, onPlaybackComplete }) {
   const { gl } = useThree()
   const playing = phase === 'playing'
@@ -555,7 +604,7 @@ function Scene({ settings, rendering, postEffects, balloons, bodyRegistry, visua
     <directionalLight position={[4, 7, 5]} intensity={rendering.keyLight} />
     <UpwardShadowLight intensity={rendering.uplight} shadows={rendering.shadows} mapSize={rendering.shadowQuality} />
     <Environment files={VENICE_SUNSET_HDR} background backgroundBlurriness={rendering.backgroundBlur} />
-    <ReflectionProbe resolution={rendering.reflectionQuality} refreshSeconds={rendering.reflectionRefresh} live={phase === 'finished'}>
+    <ReflectionProbe resolution={rendering.reflectionQuality} refreshSeconds={rendering.reflectionRefresh} live={phase === 'finished'} visualRegistry={visualRegistry}>
       <Physics gravity={[0, settings.lift, 0]} timeStep="vary" paused={phase !== 'finished'} interpolate debug={settings.debugPhysics}>
         <BalloonReturnMotion balloons={balloons} bodyRegistry={bodyRegistry} enabled={phase === 'finished'} />
         <Roof debug={settings.debugPhysics} onGeometry={onRoofGeometry} />
@@ -563,15 +612,24 @@ function Scene({ settings, rendering, postEffects, balloons, bodyRegistry, visua
       </Physics>
     </ReflectionProbe>
     <PlaybackRunner playing={playing} frames={playbackFrames} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} onComplete={onPlaybackComplete} />
-    <CameraControls mode={settings.cameraMode} />
+    <CameraControls mode={settings.cameraMode} idle={phase === 'upload' || phase === 'preparing'} />
     {postEffects.enabled && (playing || phase === 'finished') && <EffectComposer multisampling={0} enableNormalPass={false}>
-      <DepthOfField focusDistance={postEffects.focusDistance} focusRange={postEffects.focusRange} bokehScale={postEffects.blurStrength} height={postEffects.effectResolution} />
+      <CeilingDepthOfField settings={postEffects} />
       <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
     </EffectComposer>}
   </>
 }
 
 export default function App() {
+  const [initialShare] = useState(() => {
+    try { return readShareParams(window.location.search) }
+    catch { return { error: 'This share link could not be opened. Choose an image to start again.' } }
+  })
+  const [seed] = useState(() => initialShare?.seed ?? crypto.getRandomValues(new Uint32Array(1))[0])
+  const initialSettings = SIMULATION_DEFAULTS
+  const [toolsVisible, setToolsVisible] = useState(false)
+  const [shareUrl, setShareUrl] = useState('')
+  const [shareStatus, setShareStatus] = useState('')
   const [balloons, setBalloons] = useState([])
   const [imageSelection, setImageSelection] = useState(null)
   const [imageSamples, setImageSamples] = useState([])
@@ -598,13 +656,13 @@ export default function App() {
     return camera
   }, [])
   const [settings, set] = useControls('Simulation', () => ({
-    lift: { value: 2.2, min: 0.1, max: 8, step: 0.1, label: 'Upward gravity' },
-    releaseInterval: { value: 0.02, min: 0.01, max: 0.025, step: 0.001, label: 'Release rate (seconds)' },
-    maxBalloons: { value: MAX_BALLOONS, min: 5, max: MAX_BALLOONS, step: 5, label: 'Balloon limit' },
-    spawnRadius: { value: 1.75, min: 0.2, max: 2.8, step: 0.05, label: 'Spawn radius' },
-    spawnHeight: { value: 0.2, min: -0.5, max: 1.8, step: 0.1, label: 'Spawn height' },
-    balloonSize: { value: 0.06, min: 0.025, max: 0.17, step: 0.005, label: 'Balloon size' },
-    friction: { value: 0.45, min: 0, max: 2, step: 0.05, label: 'Balloon friction' },
+    lift: { value: initialSettings.lift, min: 0.1, max: 8, step: 0.1, label: 'Upward gravity' },
+    releaseInterval: { value: initialSettings.releaseInterval, min: 0.01, max: 0.025, step: 0.001, label: 'Release rate (seconds)' },
+    maxBalloons: { value: initialSettings.maxBalloons, min: 5, max: MAX_BALLOONS, step: 5, label: 'Balloon limit' },
+    spawnRadius: { value: initialSettings.spawnRadius, min: 0.2, max: 2.8, step: 0.05, label: 'Spawn radius' },
+    spawnHeight: { value: initialSettings.spawnHeight, min: -0.5, max: 1.8, step: 0.1, label: 'Spawn height' },
+    balloonSize: { value: initialSettings.balloonSize, min: 0.025, max: 0.17, step: 0.005, label: 'Balloon size' },
+    friction: { value: initialSettings.friction, min: 0, max: 2, step: 0.05, label: 'Balloon friction' },
     debugPhysics: { value: false, label: 'Wireframe + physics debug' },
     cameraMode: { value: 'Pointer tilt', options: ['Pointer tilt', 'Orbit'], label: 'Camera mode' },
   }), [])
@@ -623,8 +681,9 @@ export default function App() {
   }), [])
   const [postEffects] = useControls('Depth of field', () => ({
     enabled: { value: true, label: 'Enable DOF' },
+    autoFocus: { value: true, label: 'Auto focus ceiling' },
     focusDistance: { value: 2.65, min: 0.2, max: 8, step: 0.05, label: 'Focus distance' },
-    focusRange: { value: 1.2, min: 0.1, max: 5, step: 0.05, label: 'Focus range' },
+    focusRange: { value: 1.6, min: 0.1, max: 5, step: 0.05, label: 'Focus range' },
     blurStrength: { value: 2, min: 0, max: 8, step: 0.1, label: 'Blur strength' },
     effectResolution: { value: 360, options: { Low: 360, Medium: 540, High: 720 }, label: 'DOF quality' },
   }), [])
@@ -647,6 +706,7 @@ export default function App() {
     }
     worker.onerror = (error) => setSimulationError(error.message || 'The balloon simulation could not be prepared.')
     worker.postMessage({ type: 'simulate', ...roofGeometry, settings: {
+      seed,
       lift: settings.lift,
       releaseInterval: settings.releaseInterval,
       maxBalloons: settings.maxBalloons,
@@ -656,48 +716,91 @@ export default function App() {
       friction: settings.friction,
     } })
     return () => worker.terminate()
-  }, [roofGeometry, settings.lift, settings.releaseInterval, settings.maxBalloons, settings.spawnRadius, settings.spawnHeight, settings.balloonSize, settings.friction])
+  }, [seed, roofGeometry, settings.lift, settings.releaseInterval, settings.maxBalloons, settings.spawnRadius, settings.spawnHeight, settings.balloonSize, settings.friction])
   useEffect(() => {
     if (!imageSelection) return
+    if (imageSelection.samples) { setImageSamples(quantizeSamples(imageSelection.samples)); return }
     let cancelled = false
     const image = new Image()
     image.onload = () => {
       if (cancelled) return
       const canvas = document.createElement('canvas')
-      canvas.width = SAMPLE_SIZE
-      canvas.height = SAMPLE_SIZE
+      canvas.width = SAMPLE_GRID
+      canvas.height = SAMPLE_GRID
       const context = canvas.getContext('2d', { willReadFrequently: true })
       if (!context) { setUploadError('This image could not be read.'); setPhase('upload'); return }
       const side = Math.min(image.naturalWidth, image.naturalHeight)
       const sx = (image.naturalWidth - side) / 2
       const sy = (image.naturalHeight - side) / 2
-      context.drawImage(image, sx, sy, side, side, 0, 0, SAMPLE_SIZE, SAMPLE_SIZE)
-      const pixels = context.getImageData(0, 0, SAMPLE_SIZE, SAMPLE_SIZE).data
+      context.imageSmoothingEnabled = true
+      context.imageSmoothingQuality = 'high'
+      context.drawImage(image, sx, sy, side, side, 0, 0, SAMPLE_GRID, SAMPLE_GRID)
+      const pixels = context.getImageData(0, 0, SAMPLE_GRID, SAMPLE_GRID).data
       const samples = []
-      for (let row = 0; row < SAMPLE_GRID; row++) {
-        for (let column = 0; column < SAMPLE_GRID; column++) {
-          let red = 0, green = 0, blue = 0
-          for (let y = row * SAMPLE_BLOCK; y < (row + 1) * SAMPLE_BLOCK; y++) {
-            for (let x = column * SAMPLE_BLOCK; x < (column + 1) * SAMPLE_BLOCK; x++) {
-              const offset = (y * SAMPLE_SIZE + x) * 4
-              red += pixels[offset]
-              green += pixels[offset + 1]
-              blue += pixels[offset + 2]
-            }
-          }
-          const hex = (value) => Math.round(value / (SAMPLE_BLOCK * SAMPLE_BLOCK)).toString(16).padStart(2, '0')
-          samples.push(`#${hex(red)}${hex(green)}${hex(blue)}`)
-        }
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        const hex = (value) => value.toString(16).padStart(2, '0')
+        samples.push(`#${hex(pixels[offset])}${hex(pixels[offset + 1])}${hex(pixels[offset + 2])}`)
       }
-      setImageSamples(samples)
+      setImageSamples(quantizeSamples(samples))
     }
     image.onerror = () => { if (!cancelled) { setUploadError('This image could not be opened.'); setPhase('upload') } }
     image.src = imageSelection.src
     return () => { cancelled = true }
   }, [imageSelection])
+  useEffect(() => {
+    if (initialShare?.error) { setUploadError(initialShare.error); return }
+    if (!initialShare?.image) return
+    let cancelled = false
+    decodeSamples(initialShare.image).then(samples => {
+      if (cancelled) return
+      setImageSelection({ src: samplesPreview(samples), samples, id: ++selectionId.current })
+      setPhase('preparing')
+    }).catch(() => {
+      if (!cancelled) setUploadError('This share link could not be opened. Choose an image to start again.')
+    })
+    return () => { cancelled = true }
+  }, [initialShare])
+  useEffect(() => {
+    setShareUrl('')
+    setShareStatus('')
+    if (imageSamples.length !== SAMPLE_GRID * SAMPLE_GRID) return
+    let cancelled = false
+    encodeSamples(imageSamples).then(encoded => {
+      if (cancelled) return
+      const url = new URL(window.location.href)
+      url.searchParams.set('image', encoded)
+      url.searchParams.set('seed', String(seed))
+      url.searchParams.delete('sim')
+      window.history.replaceState(window.history.state, '', url)
+      setShareUrl(url.href)
+    }).catch(() => { if (!cancelled) setShareStatus('Could not create the share link.') })
+    return () => { cancelled = true }
+  }, [imageSamples, seed])
+  useEffect(() => {
+    if (shareStatus !== 'Copied!') return
+    const timer = window.setTimeout(() => setShareStatus(''), 2500)
+    return () => window.clearTimeout(timer)
+  }, [shareStatus])
+  const copyShareLink = async () => {
+    try {
+      await navigator.clipboard.writeText(shareUrl)
+      setShareStatus('Copied!')
+    } catch {
+      const field = document.createElement('textarea')
+      field.value = shareUrl
+      field.style.cssText = 'position:fixed;left:-9999px;top:0;'
+      document.body.appendChild(field)
+      field.select()
+      const copied = document.execCommand('copy')
+      field.remove()
+      setShareStatus(copied ? 'Copied!' : 'Could not copy. Copy the URL from your address bar.')
+    }
+  }
   useEffect(() => () => { if (uploadedUrl.current) URL.revokeObjectURL(uploadedUrl.current) }, [])
   const selectImage = (src) => {
     setUploadError('')
+    setShareUrl('')
+    setShareStatus('')
     setImageSamples([])
     setPhase('preparing')
     setImageSelection({ src, id: ++selectionId.current })
@@ -710,6 +813,11 @@ export default function App() {
   }
   useEffect(() => {
     const handleKey = (event) => {
+      if (event.code === 'F1') {
+        event.preventDefault()
+        if (!event.repeat) setToolsVisible(visible => !visible)
+        return
+      }
       if (event.repeat || event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
       if (event.code === 'KeyC') set({ cameraMode: settings.cameraMode === 'Orbit' ? 'Pointer tilt' : 'Orbit' })
       if (event.code === 'KeyD') set({ debugPhysics: !settings.debugPhysics })
@@ -742,17 +850,15 @@ export default function App() {
   }
   return <main className="app-shell">
     <div className="site-title">balloon art</div>
-    <Canvas shadows={rendering.shadows} frameloop={phase === 'playing' || phase === 'finished' ? 'always' : 'demand'} camera={{ position: [0, 1.35, 2], fov: 58 }} dpr={rendering.pixelRatio} gl={{ antialias: true, powerPreference: 'high-performance' }} style={{ cursor: phase === 'finished' ? 'grab' : 'default' }}>
+    <Canvas shadows={rendering.shadows} frameloop="always" camera={{ position: [0, 1.35, 2], fov: 62 }} dpr={rendering.pixelRatio} gl={{ antialias: true, powerPreference: 'high-performance' }} style={{ cursor: phase === 'finished' ? 'grab' : 'default' }}>
       <Scene settings={settings} rendering={rendering} postEffects={postEffects} balloons={balloons} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} phase={phase} onRoofGeometry={onRoofGeometry} playbackFrames={playbackFrames} onPlaybackComplete={finishPlayback} />
     </Canvas>
     {phase === 'upload' && <div className="experience-gate">
       <div className="experience-card">
-        <span className="eyebrow">BALLOON ART</span>
-        <h1>Turn a photo into a ceiling of balloons.</h1>
-        <p>Choose an image, then watch the balloons rise and reveal it as they settle.</p>
+        <h1>Create Balloon Art</h1>
         <PhotoDropzone large onFile={handleImageFile} />
         {uploadError && <div className="upload-error" role="alert">{uploadError}</div>}
-        <button className="sample-image" onClick={() => selectImage(CAT_SAMPLER_IMAGE)}>Try the sample cat photo</button>
+        <button className="sample-image" onClick={() => selectImage(CAT_SAMPLER_IMAGE)}><img src={CAT_SAMPLER_IMAGE} alt="" />Try a sample photo</button>
       </div>
     </div>}
     {phase === 'preparing' && <div className="precompute-screen" role="status" aria-live="polite">
@@ -765,14 +871,26 @@ export default function App() {
       </div>
     </div>}
     {(phase === 'playing' || phase === 'finished') && <>
-      <PhotoDropzone src={imageSelection?.src} onFile={handleImageFile} />
-      {phase === 'finished' && <div className="action-buttons"><button className="replay-button" onClick={() => setPhase('playing')}>Watch again</button></div>}
+      <div className="photo-tools">
+        <PhotoDropzone src={imageSelection?.src} onFile={handleImageFile} />
+        <div className="action-links">
+          <span className="share-link-wrap">
+            <button className="action-link" disabled={!shareUrl} onClick={copyShareLink} aria-describedby={shareStatus === 'Copied!' ? 'share-copy-tooltip' : undefined}>Share</button>
+            {shareStatus === 'Copied!' && <span id="share-copy-tooltip" className="share-copy-tooltip" role="tooltip" aria-live="polite">Link Copied to your clipboard</span>}
+          </span>
+          {phase === 'finished' && <button className="action-link" onClick={() => setPhase('playing')}>Watch again</button>}
+          <button className="action-link camera-mode-toggle" aria-label={settings.cameraMode === 'Orbit' ? 'Switch to standard camera' : 'Switch to free camera'} onClick={() => set({ cameraMode: settings.cameraMode === 'Orbit' ? 'Pointer tilt' : 'Orbit' })}>
+            <span className={settings.cameraMode !== 'Orbit' ? 'is-active' : ''}>Standard</span> / <span className={settings.cameraMode === 'Orbit' ? 'is-active' : ''}>Free camera</span>
+          </button>
+        </div>
+        <span className="share-status" role="status">{shareStatus !== 'Copied!' ? shareStatus : ''}</span>
+      </div>
     </>}
     <footer className="site-footer">
       <span>Another</span> <a href="https://github.com/DaveSeidman/balloon-art" target="_blank" rel="noopener noreferrer">Digital Stunt</a>
       <span> by </span><a href="https://daveseidman.com" target="_blank" rel="noopener noreferrer">Dave Seidman</a>
     </footer>
-    <Leva hidden={phase === 'upload' || phase === 'preparing'} collapsed={false} theme={{ sizes: { rootWidth: '360px', controlWidth: '180px' } }} titleBar={{ title: 'balloon art' }} />
+    <Leva hidden={!toolsVisible} collapsed={false} theme={{ sizes: { rootWidth: '360px', controlWidth: '180px' } }} titleBar={{ title: 'balloon art' }} />
   </main>
 }
 
