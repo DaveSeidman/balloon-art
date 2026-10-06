@@ -4,8 +4,10 @@ const STEP = 1 / 60
 const CAPTURE_EVERY = 4
 const MAX_ANIMATION_SECONDS = 30
 const RELEASE_WINDOW_SECONDS = 20
+const LOW_ACTIVITY_SECONDS = 0.6
 
 function keepSpeed(body) {
+  body.resetTorques(false)
   const linear = body.linvel()
   const linearSpeed = Math.hypot(linear.x, linear.y, linear.z)
   if (linearSpeed > 3.5) {
@@ -63,6 +65,9 @@ export async function simulate({ vertices, indices, ceilingPosition, settings })
   const releaseInterval = Math.min(settings.releaseInterval, RELEASE_WINDOW_SECONDS / settings.maxBalloons)
   let nextRelease = releaseInterval
   let settledFor = 0
+  let lastReleaseTime = 0
+  let ceilingTop = -Infinity
+  for (let i = 1; i < vertices.length; i += 3) ceilingTop = Math.max(ceilingTop, vertices[i] + ceilingPosition[1])
   const maxSteps = Math.ceil(MAX_ANIMATION_SECONDS / STEP)
 
   for (let tick = 1; tick <= maxSteps; tick++) {
@@ -83,11 +88,13 @@ export async function simulate({ vertices, indices, ceilingPosition, settings })
       world.createCollider(RAPIER.ColliderDesc.ball(scale * 0.13).setTranslation(0, -scale * 1.18, 0).setDensity(8).setRestitution(0.2).setFriction(settings.friction), body)
       bodies.push({ id, body })
       balloons.push({ id, position, scale })
+      lastReleaseTime = time
       nextRelease += releaseInterval
     }
 
-    if (tick % 60 === 0 && time >= RELEASE_WINDOW_SECONDS) {
-      const settle = Math.min(1, (time - RELEASE_WINDOW_SECONDS) / (MAX_ANIMATION_SECONDS - RELEASE_WINDOW_SECONDS))
+    const allReleased = bodies.length >= settings.maxBalloons
+    if (tick % 15 === 0 && allReleased) {
+      const settle = Math.min(1, (time - lastReleaseTime) / 4)
       for (const { body } of bodies) {
         body.setLinearDamping(0.2 + settle * 1.4)
         body.setAngularDamping(0.65 + settle * 2.5)
@@ -96,13 +103,31 @@ export async function simulate({ vertices, indices, ceilingPosition, settings })
     for (const { body } of bodies) keepSpeed(body)
     world.step()
 
-    const allReleased = bodies.length >= settings.maxBalloons
-    const sleeping = allReleased && bodies.every(({ body }) => body.isSleeping())
-    settledFor = sleeping ? settledFor + STEP : 0
-    if (tick % CAPTURE_EVERY === 0 || settledFor >= 0.6 || tick === maxSteps) {
+    let activity = 0
+    let quietCount = 0
+    let roomCount = 0
+    if (allReleased) {
+      for (const { body } of bodies) {
+        // Balloons that have flown above the roof cannot delay interaction in the room.
+        if (body.translation().y > ceilingTop + settings.balloonSize * 4) continue
+        const linear = body.linvel()
+        const angular = body.angvel()
+        const speed = Math.hypot(linear.x, linear.y, linear.z)
+          + Math.hypot(angular.x, angular.y, angular.z) * settings.balloonSize * 0.15
+        activity += speed
+        roomCount += 1
+        if (body.isSleeping() || speed < settings.balloonSize) quietCount += 1
+      }
+    }
+    const lowActivity = allReleased && roomCount > 0
+      && quietCount / roomCount >= 0.95
+      && activity / roomCount < settings.balloonSize * 0.6
+    settledFor = lowActivity ? settledFor + STEP : 0
+    const finished = settledFor >= LOW_ACTIVITY_SECONDS
+    if (tick % CAPTURE_EVERY === 0 || finished || tick === maxSteps) {
       frames.push(capture(bodies, time))
     }
-    if (settledFor >= 0.6) break
+    if (finished) break
   }
 
   world.free()

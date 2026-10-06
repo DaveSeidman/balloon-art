@@ -1,8 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Environment, OrbitControls, useCubeCamera, useGLTF } from '@react-three/drei'
-import { BallCollider, MeshCollider, Physics, RigidBody } from '@react-three/rapier'
+import { BallCollider, MeshCollider, Physics, RigidBody, useBeforePhysicsStep } from '@react-three/rapier'
 import { Leva, useControls } from 'leva'
+import { DepthOfField, EffectComposer, ToneMapping } from '@react-three/postprocessing'
+import { ToneMappingMode } from 'postprocessing'
 import * as THREE from 'three'
 
 import ROOF_URL from './assets/roof1.glb'
@@ -16,25 +18,9 @@ const SAMPLE_GRID = 32
 const SAMPLE_BLOCK = 8
 const SAMPLE_SIZE = SAMPLE_GRID * SAMPLE_BLOCK
 
-function PerformanceMeter({ onFps }) {
-  const frames = useRef(0)
-  const elapsed = useRef(0)
-  useFrame((_, dt) => {
-    frames.current += 1
-    elapsed.current += dt
-    if (elapsed.current >= 0.5) {
-      onFps(Math.round(frames.current / elapsed.current))
-      frames.current = 0
-      elapsed.current = 0
-    }
-  })
-  return null
-}
-
-function PlaybackRunner({ playing, frames, bodyRegistry, visualRegistry, onVisibleCount, onComplete }) {
+function PlaybackRunner({ playing, frames, bodyRegistry, visualRegistry, onComplete }) {
   const cursor = useRef(0)
   const frameIndex = useRef(0)
-  const visibleCount = useRef(-1)
   const completed = useRef(false)
   const fromRotation = useMemo(() => new THREE.Quaternion(), [])
   const toRotation = useMemo(() => new THREE.Quaternion(), [])
@@ -42,7 +28,6 @@ function PlaybackRunner({ playing, frames, bodyRegistry, visualRegistry, onVisib
     if (!playing) return
     cursor.current = 0
     frameIndex.current = 0
-    visibleCount.current = -1
     completed.current = false
     visualRegistry.current.forEach(({ balloon, ribbon }) => {
       if (balloon.current) balloon.current.visible = false
@@ -55,11 +40,6 @@ function PlaybackRunner({ playing, frames, bodyRegistry, visualRegistry, onVisib
     while (frameIndex.current < frames.length - 1 && frames[frameIndex.current + 1].time <= cursor.current) frameIndex.current += 1
     const current = frames[frameIndex.current]
     const next = frames[Math.min(frameIndex.current + 1, frames.length - 1)]
-    const count = current.poses.length / 8
-    if (count !== visibleCount.current) {
-      visibleCount.current = count
-      onVisibleCount(visibleCount.current)
-    }
     const alpha = next.time > current.time ? (cursor.current - current.time) / (next.time - current.time) : 0
     for (let offset = 0; offset < current.poses.length; offset += 8) {
       const poses = current.poses
@@ -137,6 +117,66 @@ function PointerBalloonForce({ bodyRegistry, gl, enabled = true }) {
   return null
 }
 
+function BalloonReturnMotion({ balloons, bodyRegistry, enabled }) {
+  const quietTimes = useRef(new Map())
+  const rotation = useMemo(() => new THREE.Quaternion(), [])
+  const targetRotation = useMemo(() => new THREE.Quaternion(), [])
+  useEffect(() => { quietTimes.current.clear() }, [enabled, balloons])
+  useBeforePhysicsStep((world) => {
+    if (!enabled) return
+    const dt = Math.min(world.timestep, 1 / 20)
+    const returnAmount = 1 - Math.exp(-1.3125 * dt)
+    const linearDecay = Math.exp(-3 * dt)
+    const angularDecay = Math.exp(-5 * dt)
+    for (const balloon of balloons) {
+      const body = bodyRegistry.current.get(balloon.id)?.current
+      if (!body || !balloon.restPosition) continue
+      const position = body.translation()
+      const velocity = body.linvel()
+      const angularVelocity = body.angvel()
+      const currentRotation = body.rotation()
+      const [x, y, z] = balloon.restPosition
+      const distance = Math.hypot(x - position.x, y - position.y, z - position.z)
+      rotation.set(currentRotation.x, currentRotation.y, currentRotation.z, currentRotation.w)
+      targetRotation.fromArray(balloon.restRotation)
+      const angle = rotation.angleTo(targetRotation)
+      if (body.isSleeping()) {
+        if (distance < balloon.scale * 0.08 && angle < 0.05) {
+          body.setTranslation({ x, y, z }, false)
+          body.setRotation({ x: targetRotation.x, y: targetRotation.y, z: targetRotation.z, w: targetRotation.w }, false)
+          continue
+        }
+        // Rapier may sleep before the algebraic return has reached its destination.
+        body.wakeUp()
+        quietTimes.current.delete(balloon.id)
+      }
+      body.resetForces(false)
+      body.resetTorques(false)
+      body.setLinvel({ x: velocity.x * linearDecay, y: velocity.y * linearDecay, z: velocity.z * linearDecay }, false)
+      body.setAngvel({ x: angularVelocity.x * angularDecay, y: angularVelocity.y * angularDecay, z: angularVelocity.z * angularDecay }, false)
+      body.setTranslation({
+        x: position.x + (x - position.x) * returnAmount,
+        y: position.y + (y - position.y) * returnAmount,
+        z: position.z + (z - position.z) * returnAmount,
+      }, false)
+      rotation.slerp(targetRotation, returnAmount)
+      body.setRotation({ x: rotation.x, y: rotation.y, z: rotation.z, w: rotation.w }, false)
+      const quiet = distance < balloon.scale * 0.08 && angle < 0.05
+        && Math.hypot(velocity.x, velocity.y, velocity.z) < 0.025
+        && Math.hypot(angularVelocity.x, angularVelocity.y, angularVelocity.z) < 0.05
+      const quietTime = quiet ? (quietTimes.current.get(balloon.id) || 0) + dt : 0
+      quietTimes.current.set(balloon.id, quietTime)
+      if (quietTime > 0.35) {
+        body.setTranslation({ x, y, z }, false)
+        body.setRotation({ x: targetRotation.x, y: targetRotation.y, z: targetRotation.z, w: targetRotation.w }, false)
+        body.sleep()
+        quietTimes.current.delete(balloon.id)
+      }
+    }
+  })
+  return null
+}
+
 function PhotoDropzone({ src, onFile, large = false }) {
   const [dragOver, setDragOver] = useState(false)
   const input = useRef()
@@ -174,7 +214,7 @@ function CameraRig({ mode }) {
     if (mode !== 'Pointer tilt') return
     target.current.lerp(pointer.current, 0.045)
     camera.position.set(0, 1.35, 2)
-    camera.lookAt(target.current.x * 0.8, 3.35 + target.current.y * 0.9, -1.6)
+    camera.lookAt(target.current.x * 0.8, 3.1 + target.current.y * 0.9, 0)
   })
   return null
 }
@@ -416,7 +456,7 @@ function BalloonRibbon({ body, id, scale, restColor, mesh, initialVisible, refle
   return <mesh ref={mesh} geometry={ribbon.geometry} material={material} visible={initialVisible} frustumCulled={false} />
 }
 
-function Balloon({ id, position, scale, balloonGeometry, balloonOffset, debug, friction, bodyRegistry, visualRegistry, restColor, playbackActive, initialVisible, reflectionStrength }) {
+function Balloon({ id, position, scale, balloonGeometry, balloonOffset, debug, friction, bodyRegistry, visualRegistry, restColor, restPosition, playbackActive, initialVisible, reflectionStrength }) {
   const body = useRef()
   const balloonMesh = useRef()
   const ribbonMesh = useRef()
@@ -436,11 +476,32 @@ function Balloon({ id, position, scale, balloonGeometry, balloonOffset, debug, f
     envMapIntensity: reflectionStrength,
     wireframe: debug,
   }), [id, debug, reflectionMap, restColor])
+  const shadowFade = useMemo(() => ({ value: 0 }), [])
+  const depthMaterial = useMemo(() => {
+    const depth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking })
+    depth.onBeforeCompile = (shader) => {
+      shader.uniforms.balloonShadowOpacity = shadowFade
+      shader.fragmentShader = 'uniform float balloonShadowOpacity;\n' + shader.fragmentShader
+      shader.fragmentShader = shader.fragmentShader.replace('#include <clipping_planes_fragment>', `
+        #include <clipping_planes_fragment>
+        float shadowThreshold = fract(dot(floor(gl_FragCoord.xy), vec2(0.754877666, 0.569840296)));
+        if (balloonShadowOpacity <= shadowThreshold) discard;
+      `)
+    }
+    depth.customProgramCacheKey = () => 'balloon-shadow-fade-v1'
+    return depth
+  }, [shadowFade])
   useEffect(() => { material.envMapIntensity = reflectionStrength }, [material, reflectionStrength])
   useEffect(() => () => material.dispose(), [material])
+  useEffect(() => () => depthMaterial.dispose(), [depthMaterial])
   useFrame(() => {
     if (!body.current) return
-    if (playbackActive) return
+    if (balloonMesh.current) {
+      const gap = restPosition ? Math.max(0, restPosition[1] - body.current.translation().y) : Infinity
+      shadowFade.value = 1 - THREE.MathUtils.smoothstep(gap, scale * 1.5, scale * 10)
+      balloonMesh.current.castShadow = balloonMesh.current.visible && shadowFade.value > 0.001
+    }
+    if (playbackActive || initialVisible || body.current.isSleeping()) return
 
     // Gently torque the balloon's local up axis back toward world up.
     const rotation = body.current.rotation()
@@ -469,10 +530,10 @@ function Balloon({ id, position, scale, balloonGeometry, balloonOffset, debug, f
     }
   })
   return <>
-    <RigidBody ref={body} colliders={false} position={position} enabledRotations={[true, true, true]} linearDamping={0.2} angularDamping={0.65} restitution={0.2} friction={friction}>
+    <RigidBody ref={body} colliders={false} position={position} enabledRotations={[true, true, true]} gravityScale={initialVisible ? 0 : 1} linearDamping={initialVisible ? 1.5 : 0.2} angularDamping={initialVisible ? 2 : 0.65} restitution={initialVisible ? 0 : 0.2} friction={friction}>
       <BallCollider args={[scale]} density={0.22} />
       <BallCollider args={[scale * 0.13]} position={[0, -scale * 1.18, 0]} density={8} />
-      <mesh ref={balloonMesh} geometry={balloonGeometry} position={[balloonOffset.x * scale, balloonOffset.y * scale, balloonOffset.z * scale]} scale={scale} material={material} visible={initialVisible} castShadow receiveShadow />
+      <mesh ref={balloonMesh} geometry={balloonGeometry} position={[balloonOffset.x * scale, balloonOffset.y * scale, balloonOffset.z * scale]} scale={scale} material={material} customDepthMaterial={depthMaterial} visible={initialVisible} castShadow={false} receiveShadow />
     </RigidBody>
     <BalloonRibbon body={body} id={id} scale={scale} restColor={restColor} mesh={ribbonMesh} initialVisible={initialVisible} reflectionStrength={reflectionStrength} />
   </>
@@ -484,11 +545,10 @@ function Balloons({ settings, balloons, bodyRegistry, visualRegistry, playbackAc
   return balloons.map((balloon) => <Balloon key={balloon.id} {...balloon} balloonGeometry={geometry} balloonOffset={nodes.Sphere.position} debug={settings.debugPhysics} friction={settings.friction} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} playbackActive={playbackActive} initialVisible={initialVisible} reflectionStrength={reflectionStrength} />)
 }
 
-function Scene({ settings, rendering, balloons, bodyRegistry, visualRegistry, onFps, phase, onRoofGeometry, playbackFrames, onVisibleCount, onPlaybackComplete }) {
+function Scene({ settings, rendering, postEffects, balloons, bodyRegistry, visualRegistry, phase, onRoofGeometry, playbackFrames, onPlaybackComplete }) {
   const { gl } = useThree()
   const playing = phase === 'playing'
   return <>
-    <PerformanceMeter onFps={onFps} />
     <RendererSettings exposure={rendering.exposure} shadows={rendering.shadows} />
     <PointerBalloonForce bodyRegistry={bodyRegistry} gl={gl} enabled={phase === 'finished'} />
     <ambientLight intensity={rendering.ambientLight} />
@@ -497,12 +557,17 @@ function Scene({ settings, rendering, balloons, bodyRegistry, visualRegistry, on
     <Environment files={VENICE_SUNSET_HDR} background backgroundBlurriness={rendering.backgroundBlur} />
     <ReflectionProbe resolution={rendering.reflectionQuality} refreshSeconds={rendering.reflectionRefresh} live={phase === 'finished'}>
       <Physics gravity={[0, settings.lift, 0]} timeStep="vary" paused={phase !== 'finished'} interpolate debug={settings.debugPhysics}>
+        <BalloonReturnMotion balloons={balloons} bodyRegistry={bodyRegistry} enabled={phase === 'finished'} />
         <Roof debug={settings.debugPhysics} onGeometry={onRoofGeometry} />
         <Balloons settings={settings} balloons={balloons} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} playbackActive={playing} initialVisible={phase === 'finished'} reflectionStrength={rendering.reflectionStrength} />
       </Physics>
     </ReflectionProbe>
-    <PlaybackRunner playing={playing} frames={playbackFrames} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} onVisibleCount={onVisibleCount} onComplete={onPlaybackComplete} />
+    <PlaybackRunner playing={playing} frames={playbackFrames} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} onComplete={onPlaybackComplete} />
     <CameraControls mode={settings.cameraMode} />
+    {postEffects.enabled && (playing || phase === 'finished') && <EffectComposer multisampling={0} enableNormalPass={false}>
+      <DepthOfField focusDistance={postEffects.focusDistance} focusRange={postEffects.focusRange} bokehScale={postEffects.blurStrength} height={postEffects.effectResolution} />
+      <ToneMapping mode={ToneMappingMode.ACES_FILMIC} />
+    </EffectComposer>}
   </>
 }
 
@@ -512,8 +577,6 @@ export default function App() {
   const [imageSamples, setImageSamples] = useState([])
   const [phase, setPhase] = useState('upload')
   const [uploadError, setUploadError] = useState('')
-  const [fps, setFps] = useState(0)
-  const [visibleCount, setVisibleCount] = useState(0)
   const [playbackFrames, setPlaybackFrames] = useState([])
   const [simulation, setSimulation] = useState(null)
   const [simulationError, setSimulationError] = useState('')
@@ -538,7 +601,7 @@ export default function App() {
     lift: { value: 2.2, min: 0.1, max: 8, step: 0.1, label: 'Upward gravity' },
     releaseInterval: { value: 0.02, min: 0.01, max: 0.025, step: 0.001, label: 'Release rate (seconds)' },
     maxBalloons: { value: MAX_BALLOONS, min: 5, max: MAX_BALLOONS, step: 5, label: 'Balloon limit' },
-    spawnRadius: { value: 1.55, min: 0.2, max: 2.8, step: 0.05, label: 'Spawn radius' },
+    spawnRadius: { value: 1.75, min: 0.2, max: 2.8, step: 0.05, label: 'Spawn radius' },
     spawnHeight: { value: 0.2, min: -0.5, max: 1.8, step: 0.1, label: 'Spawn height' },
     balloonSize: { value: 0.06, min: 0.025, max: 0.17, step: 0.005, label: 'Balloon size' },
     friction: { value: 0.45, min: 0, max: 2, step: 0.05, label: 'Balloon friction' },
@@ -547,16 +610,23 @@ export default function App() {
   }), [])
   const [rendering] = useControls('Rendering', () => ({
     pixelRatio: { value: 0.75, min: 0.5, max: 1.5, step: 0.05, label: 'Pixel ratio' },
-    exposure: { value: 1, min: 0.4, max: 2, step: 0.05, label: 'Exposure' },
-    ambientLight: { value: 1.4, min: 0, max: 3, step: 0.1, label: 'Ambient light' },
-    keyLight: { value: 2.1, min: 0, max: 5, step: 0.1, label: 'Directional light' },
-    uplight: { value: 3, min: 0, max: 10, step: 0.25, label: 'Upward directional light' },
-    backgroundBlur: { value: 0.12, min: 0, max: 0.8, step: 0.02, label: 'Background blur' },
+    exposure: { value: 0.95, min: 0.4, max: 2, step: 0.05, label: 'Exposure' },
+    ambientLight: { value: 0.5, min: 0, max: 3, step: 0.1, label: 'Ambient light' },
+    keyLight: { value: 3.4, min: 0, max: 5, step: 0.1, label: 'Directional light' },
+    uplight: { value: 0.75, min: 0, max: 10, step: 0.25, label: 'Upward directional light' },
+    backgroundBlur: { value: 0.06, min: 0, max: 0.8, step: 0.02, label: 'Background blur' },
     shadows: { value: true, label: 'Balloon shadows' },
-    shadowQuality: { value: 1024, options: { Low: 512, Medium: 1024, High: 2048 }, label: 'Shadow quality' },
-    reflectionStrength: { value: 1.25, min: 0, max: 3, step: 0.05, label: 'Reflection strength' },
-    reflectionQuality: { value: 64, options: { Low: 32, Medium: 64, High: 128 }, label: 'Reflection quality' },
-    reflectionRefresh: { value: 5, options: { 'At rest only': 0, 'Every 5 seconds': 5, 'Every 2 seconds': 2 }, label: 'Live reflections' },
+    shadowQuality: { value: 512, options: { Low: 512, Medium: 1024, High: 2048 }, label: 'Shadow quality' },
+    reflectionStrength: { value: 1.05, min: 0, max: 3, step: 0.05, label: 'Reflection strength' },
+    reflectionQuality: { value: 32, options: { Low: 32, Medium: 64, High: 128 }, label: 'Reflection quality' },
+    reflectionRefresh: { value: 2, options: { 'At rest only': 0, 'Every 5 seconds': 5, 'Every 2 seconds': 2 }, label: 'Live reflections' },
+  }), [])
+  const [postEffects] = useControls('Depth of field', () => ({
+    enabled: { value: true, label: 'Enable DOF' },
+    focusDistance: { value: 2.65, min: 0.2, max: 8, step: 0.05, label: 'Focus distance' },
+    focusRange: { value: 1.2, min: 0.1, max: 5, step: 0.05, label: 'Focus range' },
+    blurStrength: { value: 2, min: 0, max: 8, step: 0.1, label: 'Blur strength' },
+    effectResolution: { value: 360, options: { Low: 360, Medium: 540, High: 720 }, label: 'DOF quality' },
   }), [])
   const onRoofGeometry = useCallback((geometry) => {
     if (roofGeometryRef.current) return
@@ -652,29 +722,28 @@ export default function App() {
     const finalPoses = simulation.frames[simulation.frames.length - 1].poses
     const finalById = new Map()
     for (let offset = 0; offset < finalPoses.length; offset += 8) {
-      finalById.set(finalPoses[offset], [finalPoses[offset + 1], finalPoses[offset + 2], finalPoses[offset + 3]])
+      finalById.set(finalPoses[offset], { position: Array.from(finalPoses.slice(offset + 1, offset + 4)), rotation: Array.from(finalPoses.slice(offset + 4, offset + 8)) })
     }
     setBalloons(simulation.balloons.map((balloon) => {
-      const position = finalById.get(balloon.id)
-      if (!position) return balloon
+      const pose = finalById.get(balloon.id)
+      if (!pose) return balloon
+      const { position, rotation } = pose
       const projected = new THREE.Vector3(...position).project(samplerCamera)
       const column = THREE.MathUtils.clamp(Math.floor((projected.x + 1) * SAMPLE_GRID / 2), 0, SAMPLE_GRID - 1)
       const row = THREE.MathUtils.clamp(Math.floor((1 - projected.y) * SAMPLE_GRID / 2), 0, SAMPLE_GRID - 1)
-      return { ...balloon, restColor: imageSamples[row * SAMPLE_GRID + column] }
+      return { ...balloon, restPosition: position, restRotation: rotation, restColor: imageSamples[row * SAMPLE_GRID + column] }
     }))
     setPlaybackFrames(simulation.frames)
-    setVisibleCount(0)
     setPhase('playing')
   }, [phase, imageSamples, imageSelection, samplerCamera, simulation])
   const finishPlayback = () => {
     bodyRegistry.current.forEach((bodyRef) => bodyRef.current?.sleep())
-    setVisibleCount(balloons.length)
     setPhase('finished')
   }
   return <main className="app-shell">
     <div className="site-title">balloon art</div>
     <Canvas shadows={rendering.shadows} frameloop={phase === 'playing' || phase === 'finished' ? 'always' : 'demand'} camera={{ position: [0, 1.35, 2], fov: 58 }} dpr={rendering.pixelRatio} gl={{ antialias: true, powerPreference: 'high-performance' }} style={{ cursor: phase === 'finished' ? 'grab' : 'default' }}>
-      <Scene settings={settings} rendering={rendering} balloons={balloons} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} onFps={setFps} phase={phase} onRoofGeometry={onRoofGeometry} playbackFrames={playbackFrames} onVisibleCount={setVisibleCount} onPlaybackComplete={finishPlayback} />
+      <Scene settings={settings} rendering={rendering} postEffects={postEffects} balloons={balloons} bodyRegistry={bodyRegistry} visualRegistry={visualRegistry} phase={phase} onRoofGeometry={onRoofGeometry} playbackFrames={playbackFrames} onPlaybackComplete={finishPlayback} />
     </Canvas>
     {phase === 'upload' && <div className="experience-gate">
       <div className="experience-card">
@@ -696,13 +765,8 @@ export default function App() {
       </div>
     </div>}
     {(phase === 'playing' || phase === 'finished') && <>
-      <div className="simulation-stats" aria-live="polite">
-        <span>{visibleCount} / {balloons.length} balloons</span>
-        <span>{fps} FPS</span>
-      </div>
       <PhotoDropzone src={imageSelection?.src} onFile={handleImageFile} />
       {phase === 'finished' && <div className="action-buttons"><button className="replay-button" onClick={() => setPhase('playing')}>Watch again</button></div>}
-      {phase === 'finished' && <div className="interaction-hint">Drag through the balloons to push them</div>}
     </>}
     <footer className="site-footer">
       <span>Another</span> <a href="https://github.com/DaveSeidman/balloon-art" target="_blank" rel="noopener noreferrer">Digital Stunt</a>
