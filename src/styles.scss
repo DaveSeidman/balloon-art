@@ -1,0 +1,52 @@
+:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+body { background: #090b12; }
+.app-shell { width: 100%; height: 100%; position: relative; }
+canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+button { font: inherit; }
+.site-title { position: absolute; z-index: 20; top: 16px; left: 16px; color: #fff; font-size: 13px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; text-shadow: 0 1px 8px #0009; pointer-events: none; }
+.site-footer { position: absolute; z-index: 20; bottom: 14px; left: 16px; color: #fff; font-size: 10px; font-weight: 300; letter-spacing: 1px; line-height: 1.5; text-transform: uppercase; text-shadow: 0 1px 8px #000b; }
+.site-footer a { color: inherit; text-underline-offset: 3px; }
+.site-footer a:hover { color: #ff9aaf; }
+
+.experience-gate { position: absolute; inset: 0; z-index: 10; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 50% 15%, #31243a 0%, #13101e 42%, #090b12 100%); color: #fff; }
+.experience-card { width: min(100%, 520px); text-align: center; }
+.eyebrow { color: #f49aaa; font-size: 12px; font-weight: 800; letter-spacing: .22em; }
+.experience-card h1 { margin: 18px 0 12px; font-size: clamp(30px, 5vw, 54px); line-height: 1.08; letter-spacing: -.045em; }
+.experience-card p { margin: 0 auto 28px; max-width: 420px; color: #c9c4d2; font-size: 16px; line-height: 1.5; }
+.sample-image { margin-top: 18px; border: 0; background: transparent; color: #f4b1c0; text-decoration: underline; text-underline-offset: 4px; cursor: pointer; }
+.sample-image:hover { color: #fff; }
+.upload-error { margin-top: 14px; color: #ffadb8; font-size: 13px; }
+
+.photo-dropzone { position: absolute; z-index: 2; top: 94px; left: 16px; width: 280px; min-height: 76px; display: flex; align-items: center; gap: 12px; padding: 8px; border: 1px dashed #ffffff70; border-radius: 9px; background: #090b12d9; color: #fff; cursor: pointer; text-align: left; }
+.photo-dropzone:hover, .photo-dropzone.is-dragover { border-color: #ff8ba0; background: #29131be8; }
+.photo-dropzone input { display: none; }
+.photo-dropzone img { width: 58px; height: 58px; border-radius: 6px; object-fit: cover; flex: none; }
+.photo-dropzone div { display: grid; gap: 5px; }
+.photo-dropzone strong { font-size: 13px; }
+.photo-dropzone span { color: #c9c6d0; font-size: 11px; }
+.photo-dropzone.is-large { position: relative; inset: auto; width: 100%; min-height: 156px; justify-content: center; padding: 24px; border-radius: 18px; border-width: 2px; background: #ffffff0c; text-align: center; }
+.photo-dropzone.is-large strong { font-size: 20px; }
+.photo-dropzone.is-large span { font-size: 14px; }
+
+.precompute-screen { position: absolute; inset: 0; z-index: 10; display: flex; align-items: flex-end; justify-content: center; padding: 24px; color: #fff; pointer-events: none; }
+.precompute-card { display: flex; align-items: center; gap: 16px; width: min(100%, 530px); padding: 14px 18px; border: 1px solid #ffffff36; border-radius: 14px; background: #11131de8; box-shadow: 0 12px 40px #0007; pointer-events: auto; }
+.precompute-card img { width: 52px; height: 52px; object-fit: cover; border-radius: 8px; flex: none; }
+.precompute-card h1 { margin: 0; font-size: 16px; line-height: 1.25; }
+.precompute-card p { margin: 0; color: #c9c4d2; font-size: 12px; }
+.loading-spinner { display: block; width: 24px; height: 24px; margin-left: auto; border: 2px solid #ffffff32; border-top-color: #f18ba0; border-radius: 50%; flex: none; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.simulation-stats { position: absolute; top: 44px; left: 16px; z-index: 2; display: flex; gap: 14px; padding: 10px 13px; border: 1px solid #ffffff24; border-radius: 8px; background: #090b12cc; color: #fff; font-size: 13px; font-variant-numeric: tabular-nums; pointer-events: none; }
+.action-buttons { position: absolute; z-index: 2; left: 16px; bottom: 52px; }
+.replay-button { padding: 11px 15px; border: 1px solid #ffffff40; border-radius: 8px; background: #ec5d75; color: white; font-weight: 650; cursor: pointer; }
+.replay-button:hover { background: #f17488; }
+.interaction-hint { position: absolute; z-index: 2; top: 180px; left: 17px; color: #ffffffb8; font-size: 11px; pointer-events: none; }
+
+@media (max-width: 650px) {
+  .experience-gate, .precompute-screen { padding: 20px; }
+  .experience-card h1 { font-size: 34px; }
+  .photo-dropzone:not(.is-large) { top: auto; bottom: 100px; width: min(280px, calc(100vw - 32px)); }
+  .interaction-hint { top: auto; bottom: 82px; }
+}

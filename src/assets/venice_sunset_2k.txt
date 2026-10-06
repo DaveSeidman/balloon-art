@@ -1,0 +1,5 @@
+Venice Sunset HDRI
+Author: Greg Zaal
+Source: https://polyhaven.com/a/venice_sunset
+License: CC0
+Downloaded from Poly Haven as the 2K HDR file (venice_sunset_2k.hdr).
